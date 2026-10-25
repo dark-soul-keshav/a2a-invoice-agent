@@ -5,7 +5,7 @@ from copy import deepcopy
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import create_engine, String, Text, DateTime, select, update
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
@@ -367,20 +367,48 @@ def get_decisions(batch_id, policy_revision, packages):
         })
     return proposals
 
-def wait_for_task(principal, task_id, timeout=40):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        with SessionLocal() as db:
-            row = db.get(TaskRow, task_id)
-            if row and row.principal == principal and row.state != "TASK_STATE_WORKING":
-                return task_json(row)
-        time.sleep(0.15)
+def process_batch_task(principal: str, task_id: str, batch_id: str, policy_revision: str, packages: list):
+    """Generate a proposal after the HTTP response has returned.
+
+    State is checked before committing so a canceled task is not overwritten by
+    a late model response. The task row is the durable source of truth.
+    """
     with SessionLocal() as db:
         row = db.get(TaskRow, task_id)
-        return task_json(row) if row and row.principal == principal else None
+        if row is None or row.principal != principal or row.state != "TASK_STATE_WORKING":
+            return
+
+    try:
+        proposals = get_decisions(batch_id, policy_revision, packages)
+        proposal_data = {"batchId": batch_id, "proposals": proposals}
+        artifact = {
+            "artifactId": uuid.uuid4().hex,
+            "name": "invoice-action-proposals",
+            "parts": [{"mediaType": PROPOSAL_MIME, "data": proposal_data}]
+        }
+        with SessionLocal() as db:
+            row = db.get(TaskRow, task_id)
+            if row and row.principal == principal and row.state == "TASK_STATE_WORKING":
+                row.artifacts = [artifact]
+                row.state = "TASK_STATE_INPUT_REQUIRED"
+                row.updated_at = now()
+                db.commit()
+    except Exception:
+        # Store a generic failure; never leak provider errors or invoice data.
+        with SessionLocal() as db:
+            row = db.get(TaskRow, task_id)
+            if row and row.principal == principal and row.state == "TASK_STATE_WORKING":
+                row.state = "TASK_STATE_FAILED"
+                row.history = (row.history or []) + [{
+                    "messageId": uuid.uuid4().hex,
+                    "role": "ROLE_AGENT",
+                    "parts": [{"text": "Invoice proposal generation failed. Check provider configuration and rate limits."}]
+                }]
+                row.updated_at = now()
+                db.commit()
 
 @app.post("/a2a/message:send")
-async def send_message(request: Request):
+async def send_message(request: Request, background_tasks: BackgroundTasks):
     principal, failure = protected_request(request, True)
     if failure:
         return failure
@@ -453,62 +481,25 @@ async def send_message(request: Request):
                 if existing.body_hash != message_hash:
                     return error(409, "IDEMPOTENCY_CONFLICT", "This messageId was already used with different message content.")
                 task_id = existing.task_id
-                return JSONResponse({"task": wait_for_task(principal, task_id)}, media_type="application/a2a+json")
+                row = db.get(TaskRow, task_id)
+                return JSONResponse({"task": task_json(row)} if row else {"error": {"code": "NOT_FOUND", "message": "Task not found."}}, media_type="application/a2a+json")
 
-    # Existing same-message replay: wait for the first request to finish; never call model twice.
+    # A replay returns the durable task immediately; it never waits for the model
+    # and never starts a second generation for the same message ID.
     if not is_new_request:
-        replayed = wait_for_task(principal, task_id)
-        if replayed is None:
-            return error(404, "NOT_FOUND", "Task not found.")
-        return JSONResponse({"task": replayed}, media_type="application/a2a+json")
-
-    with SessionLocal() as db:
-        current = db.get(TaskRow, task_id)
-        is_owner = current is not None and current.principal == principal
-        is_working = is_owner and current.state == "TASK_STATE_WORKING"
-        already_has_proposal = is_owner and any(
-            any(p.get("mediaType") == PROPOSAL_MIME for p in a.get("parts", []))
-            for a in (current.artifacts or [])
-        )
-    if not is_owner:
-        return error(404, "NOT_FOUND", "Task not found.")
-    if already_has_proposal:
-        return JSONResponse({"task": task_json(current)}, media_type="application/a2a+json")
-    if not is_working:
-        # Failed task replay returns the stored terminal task unchanged.
-        return JSONResponse({"task": task_json(current)}, media_type="application/a2a+json")
-
-    try:
-        proposals = get_decisions(batch_id, policy_revision, packages)
-        proposal_data = {"batchId": batch_id, "proposals": proposals}
-        artifact = {
-            "artifactId": uuid.uuid4().hex,
-            "name": "invoice-action-proposals",
-            "parts": [{"mediaType": PROPOSAL_MIME, "data": proposal_data}]
-        }
         with SessionLocal() as db:
             row = db.get(TaskRow, task_id)
-            if row and row.principal == principal and row.state == "TASK_STATE_WORKING":
-                row.artifacts = [artifact]
-                row.state = "TASK_STATE_INPUT_REQUIRED"
-                row.updated_at = now()
-                db.commit()
-    except Exception as e:
-        # Store generic failure state; do not leak provider errors, prompts, or invoice data.
-        with SessionLocal() as db:
-            row = db.get(TaskRow, task_id)
-            if row and row.principal == principal and row.state == "TASK_STATE_WORKING":
-                row.state = "TASK_STATE_FAILED"
-                row.history = (row.history or []) + [{
-                    "messageId": uuid.uuid4().hex,
-                    "role": "ROLE_AGENT",
-                    "parts": [{"text": "Invoice proposal generation failed. Check provider configuration and rate limits."}]
-                }]
-                row.updated_at = now()
-                db.commit()
-        return error(502, "DECISION_ENGINE_UNAVAILABLE", "Could not generate a valid proposal. Check model configuration and rate limits.")
+            if row is None or row.principal != principal:
+                return error(404, "NOT_FOUND", "Task not found.")
+            return JSONResponse({"task": task_json(row)}, media_type="application/a2a+json")
+
+    # The first response is fast and contains the persisted WORKING task. FastAPI
+    # starts processing after the response is sent; clients can poll GET /tasks/{id}.
+    background_tasks.add_task(process_batch_task, principal, task_id, batch_id, policy_revision, packages)
     with SessionLocal() as db:
         row = db.get(TaskRow, task_id)
+        if row is None or row.principal != principal:
+            return error(404, "NOT_FOUND", "Task not found.")
         return JSONResponse({"task": task_json(row)}, media_type="application/a2a+json")
 
 async def handle_results(principal, message, message_hash, result_data):
