@@ -100,7 +100,7 @@ def agent_card():
             "protocolBinding": "HTTP+JSON",
             "protocolVersion": "1.0"
         }],
-        "defaultInputModes": [BATCH_MIME],
+        "defaultInputModes": [BATCH_MIME, RESULT_MIME],
         "defaultOutputModes": [PROPOSAL_MIME, RECEIPT_MIME],
         "skills": [{
             "id": "invoice_action_agent",
