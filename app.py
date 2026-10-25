@@ -5,7 +5,7 @@ from copy import deepcopy
 from typing import Any
 
 import httpx
-from fastapi import BackgroundTasks, FastAPI, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy import create_engine, String, Text, DateTime, select, update
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
@@ -19,6 +19,9 @@ RESULT_MIME = "application/vnd.ga5.invoice-action-results+json"
 RECEIPT_MIME = "application/vnd.ga5.invoice-action-receipts+json"
 ACTIONS = {"settle_invoice", "request_approval", "hold_invoice", "reject_duplicate", "open_exception"}
 MAX_BODY = 512 * 1024
+MAX_PACKAGES_PER_BATCH = 100
+MAX_AUDIT_ACTIONS_PER_BATCH = 100
+MAX_RECEIPTS_PER_BATCH = 100
 TERMINAL = {"TASK_STATE_COMPLETED", "TASK_STATE_CANCELED", "TASK_STATE_FAILED"}
 
 def now():
@@ -360,6 +363,7 @@ def get_decisions(batch_id, policy_revision, packages):
         proposals.append({
             "packageId": pid,
             "actionId": uuid.uuid4().hex,
+            "receiptNonce": uuid.uuid4().hex,
             "action": decision["action"],
             "facts": decision["facts"],
             "evidenceRefs": decision["evidenceRefs"],
@@ -367,48 +371,8 @@ def get_decisions(batch_id, policy_revision, packages):
         })
     return proposals
 
-def process_batch_task(principal: str, task_id: str, batch_id: str, policy_revision: str, packages: list):
-    """Generate a proposal after the HTTP response has returned.
-
-    State is checked before committing so a canceled task is not overwritten by
-    a late model response. The task row is the durable source of truth.
-    """
-    with SessionLocal() as db:
-        row = db.get(TaskRow, task_id)
-        if row is None or row.principal != principal or row.state != "TASK_STATE_WORKING":
-            return
-
-    try:
-        proposals = get_decisions(batch_id, policy_revision, packages)
-        proposal_data = {"batchId": batch_id, "proposals": proposals}
-        artifact = {
-            "artifactId": uuid.uuid4().hex,
-            "name": "invoice-action-proposals",
-            "parts": [{"mediaType": PROPOSAL_MIME, "data": proposal_data}]
-        }
-        with SessionLocal() as db:
-            row = db.get(TaskRow, task_id)
-            if row and row.principal == principal and row.state == "TASK_STATE_WORKING":
-                row.artifacts = [artifact]
-                row.state = "TASK_STATE_INPUT_REQUIRED"
-                row.updated_at = now()
-                db.commit()
-    except Exception:
-        # Store a generic failure; never leak provider errors or invoice data.
-        with SessionLocal() as db:
-            row = db.get(TaskRow, task_id)
-            if row and row.principal == principal and row.state == "TASK_STATE_WORKING":
-                row.state = "TASK_STATE_FAILED"
-                row.history = (row.history or []) + [{
-                    "messageId": uuid.uuid4().hex,
-                    "role": "ROLE_AGENT",
-                    "parts": [{"text": "Invoice proposal generation failed. Check provider configuration and rate limits."}]
-                }]
-                row.updated_at = now()
-                db.commit()
-
 @app.post("/a2a/message:send")
-async def send_message(request: Request, background_tasks: BackgroundTasks):
+async def send_message(request: Request):
     principal, failure = protected_request(request, True)
     if failure:
         return failure
@@ -417,90 +381,96 @@ async def send_message(request: Request, background_tasks: BackgroundTasks):
         return failure
     try:
         message = message_body(envelope)
-        message_hash = sha(canonical_json(message))  # configuration intentionally excluded
+        message_hash = sha(canonical_json(message))
     except ValueError as e:
         return error(400, "INVALID_MESSAGE", str(e))
-    message_id = message["messageId"]
 
-    # Result continuation or initial batch?
+    message_id = message["messageId"]
     result_parts = [p for p in message.get("parts", []) if isinstance(p, dict) and p.get("mediaType") == RESULT_MIME]
     batch_parts = [p for p in message.get("parts", []) if isinstance(p, dict) and p.get("mediaType") == BATCH_MIME]
     if len(result_parts) == 1 and not batch_parts:
         return await handle_results(principal, message, message_hash, result_parts[0].get("data"))
     if len(batch_parts) != 1 or result_parts:
-        return error(400, "INVALID_MESSAGE", "Message must contain one batch part or one results part.")
+        return error(400, "INVALID_MESSAGE", "Message must contain exactly one batch part or one results part.")
 
     try:
         batch = batch_parts[0].get("data")
         if not isinstance(batch, dict):
             raise ValueError("Batch data must be an object.")
-        batch_id = batch.get("batchId")
-        policy_revision = batch.get("policyRevision")
-        packages = batch.get("packages")
+        batch_id, policy_revision, packages = batch.get("batchId"), batch.get("policyRevision"), batch.get("packages")
         if not isinstance(batch_id, str) or not batch_id:
             raise ValueError("batchId is required.")
         if not isinstance(policy_revision, str) or not policy_revision:
             raise ValueError("policyRevision is required.")
         if not isinstance(packages, list) or not packages:
             raise ValueError("packages must be a non-empty array.")
-        if len(packages) > 100:
-            raise ValueError("Too many packages in one batch.")
+        if len(packages) > MAX_PACKAGES_PER_BATCH or len(packages) > MAX_AUDIT_ACTIONS_PER_BATCH:
+            raise ValueError("Batch exceeds the configured package/action audit cap.")
         config = envelope.get("configuration") or {}
-        accepted = config.get("acceptedOutputModes", [])
-        if accepted and PROPOSAL_MIME not in accepted:
+        accepted_modes = config.get("acceptedOutputModes", [])
+        if accepted_modes and PROPOSAL_MIME not in accepted_modes:
             raise ValueError("acceptedOutputModes must include the proposal output mode.")
     except ValueError as e:
         return error(400, "INVALID_BATCH", str(e))
 
-    task_id = None
-    is_new_request = False
     context_id = message.get("contextId") or uuid.uuid4().hex
+    task_id = uuid.uuid4().hex
+    # Reserve the message ID durably before model work so concurrent retries cannot
+    # create duplicate tasks or repeat model work for the same message ID.
     with SessionLocal() as db:
         existing = db.get(IdempotencyRow, (principal, message_id))
         if existing:
             if existing.body_hash != message_hash:
                 return error(409, "IDEMPOTENCY_CONFLICT", "This messageId was already used with different message content.")
-            task_id = existing.task_id
-        else:
-            task_id = uuid.uuid4().hex
-            row = TaskRow(
-                id=task_id, principal=principal, context_id=context_id, batch_id=batch_id,
-                state="TASK_STATE_WORKING", history=[deepcopy(message)], artifacts=[],
-                created_at=now(), updated_at=now()
-            )
-            db.add(row)
-            db.add(IdempotencyRow(principal=principal, message_id=message_id, body_hash=message_hash, task_id=task_id))
-            try:
-                db.commit()
-                is_new_request = True
-            except IntegrityError:
-                db.rollback()
-                existing = db.get(IdempotencyRow, (principal, message_id))
-                if not existing:
-                    return error(409, "IDEMPOTENCY_CONFLICT", "The request could not be reserved safely.")
-                if existing.body_hash != message_hash:
-                    return error(409, "IDEMPOTENCY_CONFLICT", "This messageId was already used with different message content.")
-                task_id = existing.task_id
-                row = db.get(TaskRow, task_id)
-                return JSONResponse({"task": task_json(row)} if row else {"error": {"code": "NOT_FOUND", "message": "Task not found."}}, media_type="application/a2a+json")
-
-    # A replay returns the durable task immediately; it never waits for the model
-    # and never starts a second generation for the same message ID.
-    if not is_new_request:
-        with SessionLocal() as db:
-            row = db.get(TaskRow, task_id)
-            if row is None or row.principal != principal:
+            row = db.scalar(select(TaskRow).where(TaskRow.id == existing.task_id, TaskRow.principal == principal))
+            if row is None:
                 return error(404, "NOT_FOUND", "Task not found.")
             return JSONResponse({"task": task_json(row)}, media_type="application/a2a+json")
+        row = TaskRow(id=task_id, principal=principal, context_id=context_id, batch_id=batch_id,
+                      state="TASK_STATE_WORKING", history=[deepcopy(message)], artifacts=[],
+                      created_at=now(), updated_at=now())
+        db.add(row)
+        db.add(IdempotencyRow(principal=principal, message_id=message_id, body_hash=message_hash, task_id=task_id))
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            existing = db.get(IdempotencyRow, (principal, message_id))
+            if not existing or existing.body_hash != message_hash:
+                return error(409, "IDEMPOTENCY_CONFLICT", "The message ID was concurrently reserved with different content.")
+            row = db.scalar(select(TaskRow).where(TaskRow.id == existing.task_id, TaskRow.principal == principal))
+            return JSONResponse({"task": task_json(row)} if row else {"error": {"code": "NOT_FOUND", "message": "Task not found."}}, media_type="application/a2a+json")
 
-    # The first response is fast and contains the persisted WORKING task. FastAPI
-    # starts processing after the response is sent; clients can poll GET /tasks/{id}.
-    background_tasks.add_task(process_batch_task, principal, task_id, batch_id, policy_revision, packages)
-    with SessionLocal() as db:
-        row = db.get(TaskRow, task_id)
-        if row is None or row.principal != principal:
-            return error(404, "NOT_FOUND", "Task not found.")
-        return JSONResponse({"task": task_json(row)}, media_type="application/a2a+json")
+    # Generate the proposal before returning: the initial client-visible task is
+    # INPUT_REQUIRED with a durable proposal artifact, not a transient WORKING task.
+    try:
+        proposals = get_decisions(batch_id, policy_revision, packages)
+        proposal_data = {"batchId": batch_id, "proposals": proposals}
+        artifact = {"artifactId": uuid.uuid4().hex, "name": "invoice-action-proposals",
+                    "parts": [{"mediaType": PROPOSAL_MIME, "data": proposal_data}]}
+        with SessionLocal() as db:
+            row = db.scalar(select(TaskRow).where(TaskRow.id == task_id, TaskRow.principal == principal).with_for_update())
+            if row is None:
+                return error(404, "NOT_FOUND", "Task not found.")
+            # Never resurrect a task if cancellation won while model work was running.
+            if row.state == "TASK_STATE_CANCELED":
+                return JSONResponse({"task": task_json(row)}, media_type="application/a2a+json")
+            if row.state == "TASK_STATE_WORKING":
+                row.artifacts = [artifact]
+                row.state = "TASK_STATE_INPUT_REQUIRED"
+                row.updated_at = now()
+                db.commit()
+            return JSONResponse({"task": task_json(row)}, media_type="application/a2a+json")
+    except Exception:
+        with SessionLocal() as db:
+            row = db.scalar(select(TaskRow).where(TaskRow.id == task_id, TaskRow.principal == principal).with_for_update())
+            if row is not None and row.state == "TASK_STATE_WORKING":
+                row.state = "TASK_STATE_FAILED"
+                row.history = (row.history or []) + [{"messageId": uuid.uuid4().hex, "role": "ROLE_AGENT",
+                    "parts": [{"text": "Invoice proposal generation failed. Check provider configuration and rate limits."}]}]
+                row.updated_at = now()
+                db.commit()
+        return error(502, "DECISION_ENGINE_UNAVAILABLE", "Could not generate a valid proposal. Check model configuration and rate limits.")
 
 async def handle_results(principal, message, message_hash, result_data):
     if not isinstance(result_data, dict):
@@ -537,6 +507,8 @@ async def handle_results(principal, message, message_hash, result_data):
         results = result_data.get("results")
         if not isinstance(results, list) or len(results) != len(proposals):
             return error(400, "INVALID_RESULTS", "Results must contain exactly one result for every proposal.")
+        if len(results) > MAX_RECEIPTS_PER_BATCH:
+            return error(400, "AUDIT_RECEIPT_CAP", "Results exceed the configured receipt audit cap.")
         proposal_map = {p["packageId"]: p for p in proposals}
         seen = set()
         for result in results:
@@ -549,8 +521,11 @@ async def handle_results(principal, message, message_hash, result_data):
             proposal = proposal_map[pid]
             if result.get("actionId") != proposal["actionId"] or result.get("action") != proposal["action"]:
                 return error(409, "RESULT_ACTION_MISMATCH", "Result action identity does not match the stored proposal.")
-            if result.get("outcome") not in ("ACCEPTED", "REJECTED") or not isinstance(result.get("receiptNonce"), str) or not result["receiptNonce"]:
-                return error(400, "INVALID_RESULTS", "Each result needs ACCEPTED/REJECTED and a receiptNonce.")
+            if result.get("outcome") not in ("ACCEPTED", "REJECTED"):
+                return error(400, "INVALID_RESULTS", "Each result outcome must be ACCEPTED or REJECTED.")
+            nonce = result.get("receiptNonce")
+            if not isinstance(nonce, str) or not nonce or nonce != proposal.get("receiptNonce"):
+                return error(409, "RECEIPT_NONCE_MISMATCH", "The receipt nonce must match the nonce stored with the proposal.")
         if seen != set(proposal_map):
             return error(400, "INVALID_RESULTS", "Some proposal results are missing.")
         executions = []
